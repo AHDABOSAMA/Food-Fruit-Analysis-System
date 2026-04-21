@@ -1,0 +1,611 @@
+#################################################### PART B #################################################### 
+#################################################### ###########################################################
+
+
+import os
+import glob
+import random
+import time
+import copy
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models, transforms
+from PIL import Image
+import matplotlib.pyplot as plt
+import sys
+import argparse
+import torch.nn.functional as F
+
+# Configuration
+CONFIG = {
+    "DATA_DIR": "/kaggle/input/food-fruit-v2/Project Data/Food",
+    "BATCH_SIZE": 32,
+    "IMG_SIZE": 224, # Food needs 224, not 128
+    "EMBEDDING_DIM": 128,
+    "LEARNING_RATE": 0.0001,
+    "EPOCHS": 15
+}
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Part B (Triplet) Engine: Running on {device}")
+
+
+
+
+class TripletFoodDataset(Dataset):
+    def __init__(self, root_dir, split='Train', transform=None):
+        self.root_dir = os.path.join(root_dir, split)
+        self.transform = transform
+        
+        # 1. Index the dataset
+        # Result: {'Burger': ['path/to/img1', ...], 'Pizza': [...]}
+        self.class_to_images = {}
+        self.classes = [d for d in os.listdir(self.root_dir) if os.path.isdir(os.path.join(self.root_dir, d))]
+        self.classes.sort()
+        self.flat_images = [] # List of (image_path, class_name)
+        
+        valid_exts = ('.jpg', '.jpeg', '.png')
+        
+        for cls_name in self.classes:
+            cls_folder = os.path.join(self.root_dir, cls_name)
+            imgs = [os.path.join(cls_folder, f) for f in os.listdir(cls_folder) if f.lower().endswith(valid_exts)]
+            if len(imgs) > 0:
+                self.class_to_images[cls_name] = imgs
+                for img_path in imgs:
+                    self.flat_images.append((img_path, cls_name))
+        
+        print(f"[{split}] Loaded {len(self.flat_images)} images across {len(self.classes)} classes.")
+
+    def __len__(self):
+        return len(self.flat_images)
+
+    def __getitem__(self, idx):
+        # 1. Select ANCHOR
+        anchor_path, anchor_class = self.flat_images[idx]
+        
+        # 2. Select POSITIVE (Same class, different image if possible)
+        pos_list = self.class_to_images[anchor_class]
+        if len(pos_list) > 1:
+            positive_path = random.choice(pos_list)
+            while positive_path == anchor_path: # Try to find a different one
+                positive_path = random.choice(pos_list)
+        else:
+            positive_path = anchor_path # Fallback if class only has 1 image
+            
+        # 3. Select NEGATIVE (Different Class)
+        neg_class = random.choice(self.classes)
+        while neg_class == anchor_class:
+            neg_class = random.choice(self.classes)
+        
+        negative_path = random.choice(self.class_to_images[neg_class])
+        
+        # 4. Load and Transform
+        anchor_img = Image.open(anchor_path).convert('RGB')
+        pos_img = Image.open(positive_path).convert('RGB')
+        neg_img = Image.open(negative_path).convert('RGB')
+        
+        if self.transform:
+            anchor_img = self.transform(anchor_img)
+            pos_img = self.transform(pos_img)
+            neg_img = self.transform(neg_img)
+            
+        return anchor_img, pos_img, neg_img
+
+# Data Loaders
+train_ops = transforms.Compose([
+    transforms.Resize((CONFIG['IMG_SIZE'], CONFIG['IMG_SIZE'])),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+val_ops = transforms.Compose([
+    transforms.Resize((CONFIG['IMG_SIZE'], CONFIG['IMG_SIZE'])),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+train_ds = TripletFoodDataset(CONFIG['DATA_DIR'], split='Train', transform=train_ops)
+val_ds = TripletFoodDataset(CONFIG['DATA_DIR'], split='Validation', transform=val_ops)
+
+train_loader = DataLoader(train_ds, batch_size=CONFIG['BATCH_SIZE'], shuffle=True, num_workers=2)
+val_loader = DataLoader(val_ds, batch_size=CONFIG['BATCH_SIZE'], shuffle=False, num_workers=2)
+
+
+class SiameseNetwork(nn.Module):
+    def __init__(self):
+        super(SiameseNetwork, self).__init__()
+        # Backbone: ResNet18
+        self.backbone = models.resnet18(pretrained=True)
+        
+        # Remove the classification layer
+        # Replace with embedding layer (size 512 -> 128)
+        num_features = self.backbone.fc.in_features
+        self.backbone.fc = nn.Sequential(
+            nn.Linear(num_features, 256),
+            nn.ReLU(),
+            nn.Linear(256, CONFIG['EMBEDDING_DIM']), # Output 128-d vector
+            nn.Lambda(lambda x: torch.nn.functional.normalize(x, p=2, dim=1)) # L2 Normalize (Like your lab code!)
+        )
+
+    # Helper for the Lambda layer above
+    # (PyTorch doesn't have nn.Lambda built-in so we do it in forward)
+    def forward_once(self, x):
+        return self.backbone(x)
+
+    def forward(self, anchor, positive, negative):
+        # Generate embeddings for all 3
+        embed_a = self.forward_once(anchor)
+        embed_p = self.forward_once(positive)
+        embed_n = self.forward_once(negative)
+        return embed_a, embed_p, embed_n
+
+
+# ==========================================
+# 4. TRAINING ENGINE & EXECUTION
+# ==========================================
+
+# --- Helper Layers ---
+class L2Normalize(nn.Module):
+    def forward(self, x):
+        # Force the embedding vector to have a length of 1.0
+        return torch.nn.functional.normalize(x, p=2, dim=1)
+
+class TripletModelWrapper(nn.Module):
+    def __init__(self, base_model):
+        super().__init__()
+        self.base = base_model
+    def forward(self, a, p, n):
+        # Pass all 3 images through the backbone
+        return self.base(a), self.base(p), self.base(n)
+
+# --- Training Function with Accuracy ---
+def train_triplet_network(model, train_loader, val_loader, optimizer, num_epochs=10):
+    # Standard Triplet Loss
+    criterion = nn.TripletMarginLoss(margin=1.0, p=2)
+    
+    # Store history for plotting later
+    history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
+    
+    print(f"Starting Training for {num_epochs} Epochs...")
+    
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        print("-" * 25)
+        
+        # 1. TRAIN PHASE
+        model.train()
+        running_loss = 0.0
+        correct_triplets = 0
+        total_triplets = 0
+        
+        for anchor, positive, negative in train_loader:
+            anchor, positive, negative = anchor.to(device), positive.to(device), negative.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Forward pass
+            emb_a, emb_p, emb_n = model(anchor, positive, negative)
+            
+            # Calculate Loss
+            loss = criterion(emb_a, emb_p, emb_n)
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            
+            # Calculate Accuracy (Is Dist(A,P) < Dist(A,N)?)
+            with torch.no_grad():
+                d_pos = torch.norm(emb_a - emb_p, p=2, dim=1)
+                d_neg = torch.norm(emb_a - emb_n, p=2, dim=1)
+                correct_triplets += (d_pos < d_neg).sum().item()
+                total_triplets += anchor.size(0)
+            
+        avg_train_loss = running_loss / len(train_loader)
+        avg_train_acc = correct_triplets / total_triplets
+        
+        history['train_loss'].append(avg_train_loss)
+        history['train_acc'].append(avg_train_acc)
+        
+        # 2. VALIDATION PHASE
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for anchor, positive, negative in val_loader:
+                anchor, positive, negative = anchor.to(device), positive.to(device), negative.to(device)
+                
+                emb_a, emb_p, emb_n = model(anchor, positive, negative)
+                loss = criterion(emb_a, emb_p, emb_n)
+                val_loss += loss.item()
+                
+                # Validation Accuracy
+                d_pos = torch.norm(emb_a - emb_p, p=2, dim=1)
+                d_neg = torch.norm(emb_a - emb_n, p=2, dim=1)
+                val_correct += (d_pos < d_neg).sum().item()
+                val_total += anchor.size(0)
+                
+        avg_val_loss = val_loss / len(val_loader)
+        avg_val_acc = val_correct / val_total
+        
+        history['val_loss'].append(avg_val_loss)
+        history['val_acc'].append(avg_val_acc)
+        
+        # Print Stats
+        print(f"   Train -> Loss: {avg_train_loss:.4f} | Acc: {avg_train_acc*100:.2f}%")
+        print(f"   Val   -> Loss: {avg_val_loss:.4f} | Acc: {avg_val_acc*100:.2f}%")
+
+    print("\nTraining Complete.")
+    return model, history
+
+# --- SETUP & EXECUTION ---
+
+# 1. Initialize ResNet18 (New Syntax to avoid warnings)
+base_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+
+# 2. Modify Head for Embeddings
+# Input features -> 256 -> ReLU -> 128 -> L2Norm
+base_model.fc = nn.Sequential(
+    nn.Linear(base_model.fc.in_features, 256),
+    nn.ReLU(),
+    nn.Linear(256, CONFIG['EMBEDDING_DIM']),
+    L2Normalize()
+)
+
+# 3. Wrap model for Triplet inputs
+final_model_B = TripletModelWrapper(base_model).to(device)
+
+# 4. Optimizer
+optimizer = optim.Adam(final_model_B.parameters(), lr=CONFIG['LEARNING_RATE'])
+
+# 5. Run Training
+trained_wrapper, history = train_triplet_network(
+    final_model_B, 
+    train_loader, 
+    val_loader, 
+    optimizer, 
+    num_epochs=CONFIG['EPOCHS']
+)
+
+
+
+torch.save(trained_wrapper.base.state_dict(), "/kaggle/working/model_part_B.pth")
+print(">> Model Part B saved to /kaggle/working/model_part_B.pth")
+
+
+
+
+import time
+
+def measure_inference_speed(model, loader, device):
+    model.eval()
+    total_time = 0
+    num_images = 0
+    # Grab one batch just to warm up GPU
+    inputs = next(iter(loader))
+    if isinstance(inputs, list): inputs = inputs[0] # Handle triplet list
+
+    with torch.no_grad():
+        # Start Timer
+        start = time.time()
+        for i, data in enumerate(loader):
+            if i >= 10: break
+            if isinstance(data, list): # Part B (Triplet)
+                inputs = data[0].to(device)
+            else: # Part A (Image, Label)
+                inputs = data[0].to(device)
+            _ = model(inputs)
+            total_time = time.time() - start
+            num_images += inputs.size(0)
+    avg_time = (total_time / num_images) * 1000 # Convert to milliseconds
+    print(f"Average Inference Time per Image: {avg_time:.2f} ms")
+measure_inference_speed(final_model_B.base, val_loader, device)
+
+
+
+
+# ==========================================
+# REPORT VISUALIZATION (REQUIRED FOR DELIVERABLE 9)
+# ==========================================
+
+
+def visualize_siamese_performance(model, loader, num_samples=4):
+    model.eval()
+    
+    # Get a batch of data
+    anchor, positive, negative = next(iter(loader))
+    anchor, positive, negative = anchor.to(device), positive.to(device), negative.to(device)
+    
+    # Calculate Distances
+    with torch.no_grad():
+        emb_a, emb_p, emb_n = model(anchor, positive, negative)
+        
+        # Euclidean Distances
+        dist_pos = torch.norm(emb_a - emb_p, p=2, dim=1)
+        dist_neg = torch.norm(emb_a - emb_n, p=2, dim=1)
+    
+    # Plot
+    fig, axes = plt.subplots(num_samples, 3, figsize=(15, 4 * num_samples))
+    
+    # Un-normalize for display
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    
+    for i in range(num_samples):
+        # Convert tensors to numpy images
+        img_a = anchor[i].cpu().permute(1, 2, 0).numpy() * std + mean
+        img_p = positive[i].cpu().permute(1, 2, 0).numpy() * std + mean
+        img_n = negative[i].cpu().permute(1, 2, 0).numpy() * std + mean
+        
+        # Clip to valid range [0,1]
+        img_a = np.clip(img_a, 0, 1)
+        img_p = np.clip(img_p, 0, 1)
+        img_n = np.clip(img_n, 0, 1)
+        
+        # ANCHOR
+        axes[i, 0].imshow(img_a)
+        axes[i, 0].set_title("Anchor", fontsize=14, fontweight='bold')
+        axes[i, 0].axis('off')
+        
+        # POSITIVE (Should be Small Distance)
+        d_p = dist_pos[i].item()
+        color_p = 'green' if d_p < 0.5 else 'orange' # Green if model is confident
+        axes[i, 1].imshow(img_p)
+        axes[i, 1].set_title(f"Positive (Same Class)\nDist: {d_p:.4f}", color=color_p, fontsize=14)
+        axes[i, 1].axis('off')
+        
+        # NEGATIVE (Should be Large Distance)
+        d_n = dist_neg[i].item()
+        color_n = 'green' if d_n > 0.5 else 'red' # Green if model correctly pushed it away
+        axes[i, 2].imshow(img_n)
+        axes[i, 2].set_title(f"Negative (Diff Class)\nDist: {d_n:.4f}", color=color_n, fontsize=14)
+        axes[i, 2].axis('off')
+        
+    plt.tight_layout()
+    plt.show()
+
+# Run Visualization
+visualize_siamese_performance(final_model_B, val_loader)
+
+
+
+
+%%writefile test_part_B.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models, transforms
+from PIL import Image
+import sys
+import os
+import glob
+import argparse
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+MODEL_PATH = "model_part_B.pth"
+PROTOTYPE_FILE = "food_prototypes.pt"
+OUTPUT_FILE = "part_B_prediction.txt"
+THRESHOLD = 0.5  # If distance is higher than this, it's "No Match"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==========================================
+# 2. MODEL & UTILS
+# ==========================================
+class L2Normalize(nn.Module):
+    def forward(self, x):
+        return F.normalize(x, p=2, dim=1)
+
+def load_model():
+    base_model = models.resnet18(weights=None)
+    base_model.fc = nn.Sequential(
+        nn.Linear(base_model.fc.in_features, 256),
+        nn.ReLU(),
+        nn.Linear(256, 128),
+        L2Normalize()
+    )
+    
+    if not os.path.exists(MODEL_PATH):
+        print(f"[Error] Model file {MODEL_PATH} not found.")
+        sys.exit(1)
+        
+    try:
+        base_model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    except Exception as e:
+        print(f"[Error] Loading weights failed: {e}")
+        sys.exit(1)
+        
+    base_model = base_model.to(device)
+    base_model.eval()
+    return base_model
+
+def preprocess(image_path):
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    try:
+        img = Image.open(image_path).convert('RGB')
+        return transform(img).unsqueeze(0).to(device)
+    except:
+        return None
+
+def get_embedding(model, img_path):
+    tensor = preprocess(img_path)
+    if tensor is None: return None
+    with torch.no_grad():
+        embedding = model(tensor)
+    return embedding
+
+# ==========================================
+# 3. CASE 1 LOGIC (Classification via Index)
+# ==========================================
+def create_index_case1(model, train_dir):
+    print(f">> [Case 1 Setup] Scanning {train_dir} to build Index...")
+    classes = [d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]
+    if not classes:
+        print("[Error] No class folders found.")
+        return
+
+    prototypes = {}
+    for i, class_name in enumerate(classes):
+        class_path = os.path.join(train_dir, class_name)
+        images = glob.glob(os.path.join(class_path, "*.*"))
+        valid_imgs = [img for img in images if img.lower().endswith(('.jpg', '.png'))]
+        
+        if not valid_imgs: continue
+        
+        vectors = []
+        # Simple progress indicator
+        if i % 5 == 0: print(f"   Processing {i}/{len(classes)}: {class_name}")
+
+        for img_path in valid_imgs:
+            emb = get_embedding(model, img_path)
+            if emb is not None:
+                vectors.append(emb)
+        
+        if vectors:
+            class_centroid = torch.mean(torch.stack(vectors), dim=0)
+            class_centroid = F.normalize(class_centroid, p=2, dim=1)
+            prototypes[class_name] = class_centroid
+
+    print(f"\n>> Indexing Complete. Saving {len(prototypes)} prototypes to {PROTOTYPE_FILE}")
+    torch.save(prototypes, PROTOTYPE_FILE)
+
+def run_case1_test(model, input_path):
+    if not os.path.exists(PROTOTYPE_FILE):
+        print(f"[Error] Index file not found. Run --mode index_case1 first!")
+        return
+    
+    prototypes = torch.load(PROTOTYPE_FILE)
+    
+    test_images = []
+    if os.path.isdir(input_path):
+        raw_files = glob.glob(os.path.join(input_path, "*.*"))
+        test_images = [f for f in raw_files if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+    elif os.path.isfile(input_path):
+        test_images = [input_path]
+    
+    results_buffer = []
+    print(f">> [Case 1] Testing {len(test_images)} images against Index...")
+
+    for img_path in test_images:
+        target_emb = get_embedding(model, img_path)
+        if target_emb is None: continue
+        
+        min_dist = float('inf')
+        best_class = "Unknown"
+        
+        for class_name, proto_vec in prototypes.items():
+            dist = torch.norm(target_emb - proto_vec, p=2, dim=1).item()
+            if dist < min_dist:
+                min_dist = dist
+                best_class = class_name
+        
+        img_name = os.path.basename(img_path)
+        print(f"[{img_name}] -> {best_class} (Dist: {min_dist:.4f})")
+        results_buffer.append(f"{img_name}: {best_class}")
+
+    with open(OUTPUT_FILE, "w") as f:
+        f.write("\n".join(results_buffer))
+    print(f">> Saved to {OUTPUT_FILE}")
+
+# ==========================================
+# 4. CASE 2 LOGIC (Anchor vs Candidates)
+# ==========================================
+def run_case2(model, anchor_path, candidate_dir):
+    print(f">> [Case 2] Comparing Anchor to Candidates in {candidate_dir}...")
+    
+    # 1. Process Anchor
+    anchor_emb = get_embedding(model, anchor_path)
+    if anchor_emb is None:
+        print("[Error] Could not load Anchor image.")
+        return
+
+    # 2. Get Candidates
+    raw_files = glob.glob(os.path.join(candidate_dir, "*.*"))
+    candidates = [f for f in raw_files if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+    
+    if not candidates:
+        print("[Error] No candidate images found.")
+        return
+
+    print(f"   Anchor: {os.path.basename(anchor_path)}")
+    print(f"   Candidates: {len(candidates)} found.")
+    
+    min_dist = float('inf')
+    best_match_file = "None"
+
+    # 3. Compare Loop
+    for cand in candidates:
+        cand_emb = get_embedding(model, cand)
+        if cand_emb is None: continue
+        
+        # Calculate Distance
+        dist = torch.norm(anchor_emb - cand_emb, p=2, dim=1).item()
+        
+        print(f"      vs {os.path.basename(cand)}: {dist:.4f}")
+        
+        if dist < min_dist:
+            min_dist = dist
+            best_match_file = os.path.basename(cand)
+
+    # 4. Result Logic
+    final_output = ""
+    if min_dist < THRESHOLD:
+        final_output = f"Match Found: {best_match_file} (Dist: {min_dist:.4f})"
+        print(f"\n>> RESULT: MATCH! Most similar is {best_match_file}")
+    else:
+        final_output = "No Match"
+        print(f"\n>> RESULT: NO MATCH. (Closest was {best_match_file} at {min_dist:.4f}, but Threshold is {THRESHOLD})")
+
+    with open(OUTPUT_FILE, "w") as f:
+        f.write(final_output)
+    print(f">> Saved result to {OUTPUT_FILE}")
+
+# ==========================================
+# 5. MAIN
+# ==========================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # Note: Updated choices to include case2
+    parser.add_argument('--mode', type=str, choices=['index_case1', 'test_case1', 'case2'], required=True)
+    
+    # Arguments for Case 1
+    parser.add_argument('--train_dir', type=str, help="Path to Training Data (for index_case1)")
+    parser.add_argument('--input', type=str, help="Path to Test Image/Folder (for test_case1)")
+    
+    # Arguments for Case 2
+    parser.add_argument('--anchor', type=str, help="Path to Anchor Image (for case2)")
+    parser.add_argument('--candidates', type=str, help="Path to Candidate Folder (for case2)")
+    
+    args = parser.parse_args()
+    model = load_model()
+    
+    if args.mode == 'index_case1':
+        if not args.train_dir:
+            print("Error: --train_dir required.")
+        else:
+            create_index_case1(model, args.train_dir)
+            
+    elif args.mode == 'test_case1':
+        if not args.input:
+            print("Error: --input required.")
+        else:
+            run_case1_test(model, args.input)
+            
+    elif args.mode == 'case2':
+        if not args.anchor or not args.candidates:
+            print("Error: --anchor and --candidates required for Case 2.")
+        else:
+            run_case2(model, args.anchor, args.candidates)
