@@ -1,0 +1,433 @@
+import os
+import glob
+import time
+import copy
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models, transforms
+from PIL import Image
+import matplotlib.pyplot as plt
+import numpy as np
+import matplotlib.pyplot as plt
+
+device_name = "cuda" if torch.cuda.is_available() else "cpu"
+device = torch.device(device_name)
+
+CONFIG = {
+    "DATA_DIR": "/kaggle/input/food-fruit-v1/Project Data",
+    "BATCH_SIZE": 32,
+    "LEARNING_RATE": 0.0001,
+    "EPOCHS": 8,
+    "IMG_SIZE": 224,
+    "NUM_WORKERS": 2
+}
+
+print(f"System ready. Running on: {device_name.upper()}")
+
+
+# ==========================================
+# CUSTOM DATASET CLASS
+# ==========================================
+class DualCategoryDataset(Dataset):
+    def __init__(self, root_path, mode='Train', transform=None):
+        """
+        Custom loader to handle the nested Fruit structure vs flat Food structure.
+        mode: 'Train' or 'Validation'
+        """
+        self.transform = transform
+        self.file_list = []
+        self.labels = [] # 0 -> Food, 1 -> Fruit
+        
+        # 1. Process FOOD Directory
+        food_path = os.path.join(root_path, 'Food', mode)
+        food_files = glob.glob(os.path.join(food_path, '**', '*.*'), recursive=True)
+        
+        valid_exts = ('.jpg', '.jpeg', '.png', '.bmp')
+        
+        count_food = 0
+        for f_path in food_files:
+            if f_path.lower().endswith(valid_exts):
+                self.file_list.append(f_path)
+                self.labels.append(0) # LABEL 0: FOOD
+                count_food += 1
+
+        # 2. Process FRUIT Directory
+        fruit_path = os.path.join(root_path, 'Fruit', mode)
+        fruit_files = glob.glob(os.path.join(fruit_path, '**', '*.*'), recursive=True)
+        
+        count_fruit = 0
+        for f_path in fruit_files:
+            if f_path.lower().endswith(valid_exts):
+                if 'mask' not in f_path.lower() and 'images' in f_path.lower():
+                    self.file_list.append(f_path)
+                    self.labels.append(1)
+                    count_fruit += 1
+        
+        print(f"[{mode}] Loaded {count_food} Food items and {count_fruit} Fruit items.")
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        img_path = self.file_list[idx]
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[idx]
+        
+        if self.transform:
+            image = self.transform(image)
+            
+        return image, label
+
+# ==========================================
+# TRANSFORMS & LOADERS
+# ==========================================
+
+train_ops = transforms.Compose([
+    transforms.Resize((CONFIG['IMG_SIZE'], CONFIG['IMG_SIZE'])),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(10),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+val_ops = transforms.Compose([
+    transforms.Resize((CONFIG['IMG_SIZE'], CONFIG['IMG_SIZE'])),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+# Initialize Datasets
+train_ds = DualCategoryDataset(CONFIG['DATA_DIR'], mode='Train', transform=train_ops)
+valid_ds = DualCategoryDataset(CONFIG['DATA_DIR'], mode='Validation', transform=val_ops)
+
+# Initialize Loaders
+train_dl = DataLoader(train_ds, batch_size=CONFIG['BATCH_SIZE'], shuffle=True, num_workers=CONFIG['NUM_WORKERS'])
+valid_dl = DataLoader(valid_ds, batch_size=CONFIG['BATCH_SIZE'], shuffle=False, num_workers=CONFIG['NUM_WORKERS'])
+
+
+# ==========================================
+# TRAINING ENGINE
+# ==========================================
+def execute_training(model, tr_loader, val_loader, criterion, optimizer, epochs=10):
+    start_timer = time.time()
+    
+    history_log = {'t_loss': [], 't_acc': [], 'v_loss': [], 'v_acc': []}
+    
+    # Save best weights
+    best_weights = copy.deepcopy(model.state_dict())
+    best_acc_score = 0.0
+
+    for ep in range(epochs):
+        print(f"\n=== Epoch {ep+1}/{epochs} ===")
+        
+        # TRAIN LOOP
+        model.train()
+        run_loss, run_correct = 0.0, 0
+        
+        for inputs, targets in tr_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            loss = criterion(outputs, targets)
+            
+            loss.backward()
+            optimizer.step()
+            
+            run_loss += loss.item() * inputs.size(0)
+            run_correct += torch.sum(preds == targets.data)
+            
+        epoch_t_loss = run_loss / len(tr_loader.dataset)
+        epoch_t_acc = run_correct.double() / len(tr_loader.dataset)
+        
+        model.eval()
+        val_loss_total, val_correct = 0.0, 0
+        
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                outputs = model(inputs)
+                _, preds = torch.max(outputs, 1)
+                loss = criterion(outputs, targets)
+                
+                val_loss_total += loss.item() * inputs.size(0)
+                val_correct += torch.sum(preds == targets.data)
+                
+        epoch_v_loss = val_loss_total / len(val_loader.dataset)
+        epoch_v_acc = val_correct.double() / len(val_loader.dataset)
+        
+        print(f"Train -> Loss: {epoch_t_loss:.4f} | Acc: {epoch_t_acc:.4f}")
+        print(f"Valid -> Loss: {epoch_v_loss:.4f} | Acc: {epoch_v_acc:.4f}")
+        
+        history_log['t_loss'].append(epoch_t_loss)
+        history_log['t_acc'].append(epoch_t_acc.item())
+        history_log['v_loss'].append(epoch_v_loss)
+        history_log['v_acc'].append(epoch_v_acc.item())
+        
+        if epoch_v_acc > best_acc_score:
+            best_acc_score = epoch_v_acc
+            best_weights = copy.deepcopy(model.state_dict())
+            print(">> Saving new best model state...")
+
+    total_time = time.time() - start_timer
+    print(f"\nTraining Finished. Time: {total_time//60:.0f}m {total_time%60:.0f}s")
+    print(f"Top Validation Accuracy: {best_acc_score:.4f}")
+    
+    model.load_state_dict(best_weights)
+    return model, history_log
+
+
+
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
+cnn_model = models.resnet18(pretrained=True)
+in_features = cnn_model.fc.in_features
+cnn_model.fc = nn.Linear(in_features, 2)
+cnn_model = cnn_model.to(device)
+
+loss_func = nn.CrossEntropyLoss()
+opt = optim.Adam(cnn_model.parameters(), lr=CONFIG['LEARNING_RATE'])
+
+if __name__ == "__main__":
+    trained_model, results = execute_training(
+        cnn_model, 
+        train_dl, 
+        valid_dl, 
+        loss_func, 
+        opt, 
+        epochs=CONFIG['EPOCHS']
+    )
+    
+    save_path = "/kaggle/working/part_A_binary_classifier.pth"
+    torch.save(trained_model.state_dict(), save_path)
+    print(f"Model saved successfully to: {save_path}")
+
+
+
+
+def visualize_balanced_results(model, loader):
+    model.eval()
+    
+    food_images = []
+    fruit_images = []
+    
+    class_names = {0: 'Food', 1: 'Fruit'}
+    
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            
+            for i in range(inputs.size(0)):
+                current_label = labels[i].item()
+                current_pred = preds[i].item()
+                
+                img = inputs.cpu().data[i].numpy().transpose((1, 2, 0))
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                img = std * img + mean
+                img = np.clip(img, 0, 1)
+                
+                if current_label == 0 and len(food_images) < 3:
+                    food_images.append((img, current_label, current_pred))
+                
+                elif current_label == 1 and len(fruit_images) < 3:
+                    fruit_images.append((img, current_label, current_pred))
+                
+                if len(food_images) == 3 and len(fruit_images) == 3:
+                    break
+            
+            if len(food_images) == 3 and len(fruit_images) == 3:
+                break
+
+    all_images = food_images + fruit_images
+    plt.figure(figsize=(15, 8))
+    
+    for i, (img, true_lbl, pred_lbl) in enumerate(all_images):
+        ax = plt.subplot(2, 3, i + 1)
+        plt.imshow(img)
+        
+        # Style the title
+        color = 'green' if true_lbl == pred_lbl else 'red'
+        ax.set_title(f"True: {class_names[true_lbl]}\nPred: {class_names[pred_lbl]}", 
+                     color=color, fontsize=12, fontweight='bold')
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+visualize_balanced_results(trained_model, valid_dl)
+
+
+
+import time
+
+def measure_inference_speed(model, loader, device):
+    model.eval()
+    total_time = 0
+    num_images = 0
+    
+    # Grab one batch just to warm up GPU
+    inputs, _ = next(iter(loader))
+    inputs = inputs.to(device)
+    
+    with torch.no_grad():
+        # Start Timer
+        start = time.time()
+        for i, (inputs, _) in enumerate(loader):
+            if i >= 10: break # Only test 10 batches to save time
+            
+            inputs = inputs.to(device)
+            _ = model(inputs)
+            
+            num_images += inputs.size(0)
+            
+        end = time.time()
+        
+    avg_time = ((end - start) / num_images) * 1000 # Convert to milliseconds
+    print(f"Average Inference Time per Image: {avg_time:.2f} ms")
+
+# Run it
+measure_inference_speed(cnn_model, valid_dl, device)
+
+
+
+
+%%writefile test_part_A.py
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from PIL import Image
+import sys
+import os
+import glob
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+MODEL_PATH = "part_A_binary_classifier.pth"
+OUTPUT_FILE = "part_A_prediction.txt"
+
+# Classes mapping
+CLASSES = {0: "Food", 1: "Fruit"}
+
+def setup_model():
+    """
+    Loads model architecture and weights.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Re-build ResNet18
+    model = models.resnet18(weights=None)
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs, 2)
+    
+    # Load Weights
+    if not os.path.exists(MODEL_PATH):
+        print(f"[ERROR] Model file '{MODEL_PATH}' not found in current directory.")
+        sys.exit(1)
+        
+    try:
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    except Exception as e:
+        print(f"[ERROR] Failed to load weights: {e}")
+        sys.exit(1)
+        
+    model = model.to(device)
+    model.eval()
+    return model, device
+
+def predict_single_image(model, device, img_path):
+    """
+    Runs inference on a single image file.
+    Returns: Class Name (String) or None if error.
+    """
+    # Preprocessing
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    try:
+        image = Image.open(img_path).convert('RGB')
+        input_tensor = transform(image).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            outputs = model(input_tensor)
+            _, preds = torch.max(outputs, 1)
+            
+        return CLASSES[preds.item()]
+    except Exception as e:
+        print(f"  [Warn] Could not process {os.path.basename(img_path)}: {e}")
+        return None
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python test_part_A.py <path_to_image_OR_folder>")
+        sys.exit(1)
+
+    input_path = sys.argv[1]
+    model, device = setup_model()
+    
+    results = []
+
+    # CASE 1: Input is a Directory (Batch Mode)
+    if os.path.isdir(input_path):
+        print(f">> Processing batch from folder: {input_path}")
+        # Find all images
+        extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+        image_files = set() # USE A SET TO PREVENT DUPLICATES
+        
+        for ext in extensions:
+            # Check lowercase extension
+            image_files.update(glob.glob(os.path.join(input_path, ext)))
+            # Check uppercase extension
+            image_files.update(glob.glob(os.path.join(input_path, ext.upper())))
+        
+        # Sort them to look nice
+        sorted_files = sorted(list(image_files))
+        
+        if not sorted_files:
+            print(">> No images found in this folder.")
+            sys.exit(0)
+
+        print(f">> Found {len(sorted_files)} unique images. Starting inference...")
+        
+        for img_p in sorted_files:
+            prediction = predict_single_image(model, device, img_p)
+            if prediction:
+                filename = os.path.basename(img_p)
+                print(f"  {filename} -> {prediction}")
+                results.append(f"{filename}: {prediction}")
+
+    # CASE 2: Input is a Single File
+    elif os.path.isfile(input_path):
+        print(f">> Processing single file: {input_path}")
+        prediction = predict_single_image(model, device, input_path)
+        if prediction:
+            print(f"  Result -> {prediction}")
+            results.append(prediction)
+    
+    else:
+        print(f"[ERROR] Input {input_path} is not a valid file or directory.")
+        sys.exit(1)
+
+    # Save to file
+    with open(OUTPUT_FILE, "w") as f:
+        f.write("\n".join(results))
+    
+    print(f"\n>> All results saved to {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
